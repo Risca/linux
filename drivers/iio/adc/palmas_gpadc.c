@@ -82,6 +82,11 @@ struct palmas_gpadc_thresholds {
 	int low_thresh;
 };
 
+struct palmas_adc_event {
+	int channel;
+	enum iio_event_direction direction;
+};
+
 /*
  * struct palmas_gpadc - the palmas_gpadc structure
  * @ch0_current:	channel 0 current source setting
@@ -116,22 +121,18 @@ struct palmas_gpadc {
 	bool				wakeup1_enable;
 	bool				wakeup2_enable;
 	int				auto_conversion_period;
-	struct palmas_adc_wakeup_property event0;
-	struct palmas_adc_wakeup_property event1;
+	struct palmas_adc_event		event0;
+	struct palmas_adc_event		event1;
 	struct palmas_gpadc_thresholds	thresh_data[PALMAS_ADC_CH_MAX];
 };
 
-static struct palmas_adc_wakeup_property *palmas_gpadc_get_event_channel(
+static struct palmas_adc_event *palmas_gpadc_get_event_channel(
 	struct palmas_gpadc *adc, int adc_chan, enum iio_event_direction dir)
 {
-	if (adc_chan == adc->event0.adc_channel_number &&
-	    ((dir == IIO_EV_DIR_RISING && adc->event0.adc_high_threshold) ||
-	     (dir == IIO_EV_DIR_FALLING && adc->event0.adc_low_threshold)))
+	if (adc_chan == adc->event0.channel && dir == adc->event0.direction)
 		return &adc->event0;
 
-	if (adc_chan == adc->event1.adc_channel_number &&
-	    ((dir == IIO_EV_DIR_RISING && adc->event1.adc_high_threshold) ||
-	     (dir == IIO_EV_DIR_FALLING && adc->event1.adc_low_threshold)))
+	if (adc_chan == adc->event1.channel && dir == adc->event1.direction)
 		return &adc->event1;
 
 	return NULL;
@@ -208,19 +209,18 @@ static irqreturn_t palmas_gpadc_irq_auto(int irq, void *data)
 {
 	struct iio_dev *indio_dev = data;
 	struct palmas_gpadc *adc = iio_priv(indio_dev);
-	struct palmas_adc_wakeup_property *ev;
+	struct palmas_adc_event *ev;
 
 	dev_dbg(adc->dev, "Threshold interrupt %d occurs\n", irq);
 	palmas_disable_auto_conversion(adc);
 
 	ev = (irq == adc->irq_auto_0) ? &adc->event0 : &adc->event1;
-	if (ev->adc_channel_number != -1) {
+	if (ev->channel != -1) {
 		enum iio_event_direction dir;
 		u64 code;
 
-		dir = ev->adc_high_threshold ?
-			IIO_EV_DIR_RISING : IIO_EV_DIR_FALLING;
-		code = IIO_UNMOD_EVENT_CODE(IIO_VOLTAGE, ev->adc_channel_number,
+		dir = ev->direction;
+		code = IIO_UNMOD_EVENT_CODE(IIO_VOLTAGE, ev->channel,
 					    IIO_EV_TYPE_THRESH, dir);
 		iio_push_event(indio_dev, code, iio_get_time_ns(indio_dev));
 	}
@@ -380,7 +380,7 @@ static int palmas_gpadc_start_conversion(struct palmas_gpadc *adc, int adc_chan)
 
 	if (freerunning) {
 		const unsigned int reg =
-			(adc_chan == adc->event0.adc_channel_number) ?
+			(adc_chan == adc->event0.channel) ?
 				PALMAS_GPADC_AUTO_CONV0_LSB :
 				PALMAS_GPADC_AUTO_CONV1_LSB;
 
@@ -442,9 +442,12 @@ static int palmas_gpadc_get_calibrated_code(struct palmas_gpadc *adc,
 }
 
 static int palmas_gpadc_get_high_threshold(struct palmas_gpadc *adc,
-					   int adc_chan, int val)
+					   struct palmas_adc_event *ev)
 {
 	const int INL = 2;
+	const int adc_chan = ev->channel;
+	const int orig = adc->thresh_data[adc_chan].high_thresh;
+	int val = orig;
 	int gain_drift;
 	int offset_drift;
 
@@ -476,9 +479,12 @@ static int palmas_gpadc_get_high_threshold(struct palmas_gpadc *adc,
 }
 
 static int palmas_gpadc_get_low_threshold(struct palmas_gpadc *adc,
-					  int adc_chan, int val)
+					  struct palmas_adc_event *ev)
 {
 	const int INL = 2;
+	const int adc_chan = ev->channel;
+	const int orig = adc->thresh_data[adc_chan].low_thresh;
+	int val = orig;
 	int gain_drift;
 	int offset_drift;
 
@@ -577,41 +583,37 @@ static int palmas_gpadc_read_event_config(struct iio_dev *indio_dev,
 	return ret;
 }
 
+static void palmas_adc_event_to_wakeup(struct palmas_gpadc *adc,
+				       struct palmas_adc_event *ev,
+				       struct palmas_adc_wakeup_property *wakeup)
+{
+	wakeup->adc_channel_number = ev->channel;
+	if (ev->direction == IIO_EV_DIR_RISING) {
+		wakeup->adc_low_threshold = 0;
+		wakeup->adc_high_threshold =
+			palmas_gpadc_get_high_threshold(adc, &adc->event0);
+	}
+	else {
+		wakeup->adc_low_threshold =
+			palmas_gpadc_get_low_threshold(adc, &adc->event0);
+		wakeup->adc_high_threshold = 0;
+	}
+}
+
 static int palmas_adc_wakeup_configure(struct palmas_gpadc *adc);
 static int palmas_gpadc_reconfigure_event_channels(struct palmas_gpadc *adc)
 {
-	adc->wakeup1_data = adc->event0;
-	adc->wakeup1_enable = adc->event0.adc_channel_number == -1 ?
-		false : true;
-	adc->wakeup2_data = adc->event1;
-	adc->wakeup2_enable = adc->event1.adc_channel_number == -1 ?
-		false : true;
+	adc->wakeup1_enable = adc->event0.channel == -1 ? false : true;
+	adc->wakeup2_enable = adc->event1.channel == -1 ? false : true;
 
-	if (adc->event0.adc_channel_number == -1 &&
-	    adc->event1.adc_channel_number == -1)
+	if (!adc->wakeup1_enable && !adc->wakeup2_enable)
 		return palmas_disable_auto_conversion(adc);
 
 	// adjust levels
-	if (adc->wakeup1_enable) {
-		adc->wakeup1_data.adc_low_threshold =
-			palmas_gpadc_get_low_threshold(adc,
-				adc->event0.adc_channel_number,
-				adc->event0.adc_low_threshold);
-		adc->wakeup1_data.adc_high_threshold =
-			palmas_gpadc_get_high_threshold(adc,
-				adc->event0.adc_channel_number,
-				adc->event0.adc_high_threshold);
-	}
-	if (adc->wakeup2_enable) {
-		adc->wakeup2_data.adc_low_threshold =
-			palmas_gpadc_get_low_threshold(adc,
-				adc->event1.adc_channel_number,
-				adc->event1.adc_low_threshold);
-		adc->wakeup2_data.adc_high_threshold =
-			palmas_gpadc_get_high_threshold(adc,
-				adc->event1.adc_channel_number,
-				adc->event1.adc_high_threshold);
-	}
+	if (adc->wakeup1_enable)
+		palmas_adc_event_to_wakeup(adc, &adc->event0, &adc->wakeup1_data);
+	if (adc->wakeup2_enable)
+		palmas_adc_event_to_wakeup(adc, &adc->event1, &adc->wakeup2_data);
 
 	return palmas_adc_wakeup_configure(adc);
 }
@@ -619,18 +621,18 @@ static int palmas_gpadc_reconfigure_event_channels(struct palmas_gpadc *adc)
 static int palmas_gpadc_enable_event_config(struct palmas_gpadc *adc,
 	const struct iio_chan_spec *chan, enum iio_event_direction dir)
 {
-	struct palmas_adc_wakeup_property *ev;
+	struct palmas_adc_event *ev;
 	int adc_chan = chan->channel;
 
 	if (palmas_gpadc_get_event_channel(adc, adc_chan, dir))
 		/* already enabled */
 		return 0;
 
-	if (adc->event0.adc_channel_number == -1)
+	if (adc->event0.channel == -1)
 		ev = &adc->event0;
-	else if (adc->event1.adc_channel_number == -1) {
+	else if (adc->event1.channel == -1) {
 		/* event0 has to be the lowest channel */
-		if (adc_chan < adc->event0.adc_channel_number) {
+		if (adc_chan < adc->event0.channel) {
 			adc->event1 = adc->event0;
 			ev = &adc->event0;
 		}
@@ -639,16 +641,12 @@ static int palmas_gpadc_enable_event_config(struct palmas_gpadc *adc,
 	}
 	else /* both AUTO channels already in use */ {
 		dev_warn(adc->dev, "event0 - %d, event1 - %d\n",
-			 adc->event0.adc_channel_number,
-			 adc->event1.adc_channel_number);
+			 adc->event0.channel, adc->event1.channel);
 		return -EBUSY;
 	}
 
-	ev->adc_channel_number = adc_chan;
-	if (dir == IIO_EV_DIR_RISING)
-		ev->adc_high_threshold = adc->thresh_data[adc_chan].high_thresh;
-	else
-		ev->adc_low_threshold = adc->thresh_data[adc_chan].low_thresh;
+	ev->channel = adc_chan;
+	ev->direction = dir;
 
 	return palmas_gpadc_reconfigure_event_channels(adc);
 }
@@ -657,7 +655,7 @@ static int palmas_gpadc_disable_event_config(struct palmas_gpadc *adc,
 	const struct iio_chan_spec *chan, enum iio_event_direction dir)
 {
 	int adc_chan = chan->channel;
-	struct palmas_adc_wakeup_property *ev =
+	struct palmas_adc_event *ev =
 		palmas_gpadc_get_event_channel(adc, adc_chan, dir);
 
 	if (!ev)
@@ -668,9 +666,8 @@ static int palmas_gpadc_disable_event_config(struct palmas_gpadc *adc,
 		ev = &adc->event1;
 	}
 
-	ev->adc_channel_number = -1;
-	ev->adc_high_threshold = 0;
-	ev->adc_low_threshold = 0;
+	ev->channel = -1;
+	ev->direction = IIO_EV_DIR_NONE;
 
 	return palmas_gpadc_reconfigure_event_channels(adc);
 }
@@ -936,8 +933,10 @@ static int palmas_gpadc_probe(struct platform_device *pdev)
 		adc->wakeup2_enable = true;
 	}
 
-	adc->event0.adc_channel_number = -1;
-	adc->event1.adc_channel_number = -1;
+	adc->event0.channel = -1;
+	adc->event0.direction = IIO_EV_DIR_NONE;
+	adc->event1.channel = -1;
+	adc->event1.direction = IIO_EV_DIR_NONE;
 
 	/* set the current source 0 (value 0/5/15/20 uA => 0..3) */
 	if (gpadc_pdata->ch0_current <= 1)
