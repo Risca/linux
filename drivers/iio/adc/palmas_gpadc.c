@@ -469,6 +469,10 @@ static int palmas_gpadc_get_high_threshold(struct palmas_gpadc *adc,
 	// add tolerance to threshold
 	val = ((val + INL) * gain_drift) / 1000 + offset_drift;
 
+	// clamp to max possible value
+	if (val > 0xFFF)
+		val = 0xFFF;
+
 	return val;
 }
 
@@ -498,6 +502,10 @@ static int palmas_gpadc_get_low_threshold(struct palmas_gpadc *adc,
 
 	// calculate tolerances
 	val = ((val - INL) * gain_drift) / 1000 - offset_drift;
+
+	// clamp to minimum 0
+	if (val < 0)
+		val = 0;
 
 	return val;
 }
