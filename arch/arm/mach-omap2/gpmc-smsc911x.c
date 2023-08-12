@@ -36,6 +36,9 @@ static struct smsc911x_platform_config gpmc_smsc911x_config = {
 	.phy_interface	= PHY_INTERFACE_MODE_MII,
 	.irq_polarity	= SMSC911X_IRQ_POLARITY_ACTIVE_LOW,
 	.irq_type	= SMSC911X_IRQ_TYPE_OPEN_DRAIN,
+	.mac		= {
+		0x02, 0x01, 0x03, 0x74, 0x16, 0xf0,
+	},
 };
 
 /*
